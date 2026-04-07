@@ -164,6 +164,8 @@ class ExecutionStream:
         result = await stream.wait_for_completion(exec_id)
     """
 
+    _CANCEL_GRACE_SECONDS: float = 0.25
+
     def __init__(
         self,
         stream_id: str,
@@ -536,6 +538,14 @@ class ExecutionStream:
                         node.cancel_current_turn()
             await self.cancel_execution(eid, reason="Restarted with new execution")
 
+        # Give cancelling tasks a short grace window to finish before failing
+        # fast with ExecutionAlreadyRunningError.
+        running_tasks = [
+            task for task in self._execution_tasks.values() if task is not None and not task.done()
+        ]
+        if running_tasks:
+            await asyncio.wait(running_tasks, timeout=self._CANCEL_GRACE_SECONDS)
+
         # When resuming, reuse the original session ID so the execution
         # continues in the same session directory instead of creating a new one.
         resume_session_id = session_state.get("resume_session_id") if session_state else None
@@ -580,12 +590,20 @@ class ExecutionStream:
         )
 
         async with self._lock:
+            still_running = [
+                eid
+                for eid, task in self._execution_tasks.items()
+                if task is not None and not task.done()
+            ]
+            if still_running:
+                raise ExecutionAlreadyRunningError(self.stream_id, still_running)
+
             self._active_executions[execution_id] = ctx
             self._completion_events[execution_id] = asyncio.Event()
-
-        # Start execution task
-        task = asyncio.create_task(self._run_execution(ctx))
-        self._execution_tasks[execution_id] = task
+            # Start execution task under the same lock as bookkeeping writes
+            # so concurrent execute() calls cannot interleave between check and set.
+            task = asyncio.create_task(self._run_execution(ctx))
+            self._execution_tasks[execution_id] = task
 
         logger.debug(f"Queued execution {execution_id} for stream {self.stream_id}")
         return execution_id
@@ -1231,20 +1249,58 @@ class ExecutionStream:
             # respond to cancellation quickly.
             done, _ = await asyncio.wait({task}, timeout=5.0)
             if not done:
-                # Task didn't finish within timeout — clean up bookkeeping now
-                # so the session doesn't think it still has running executions.
-                # The task will continue winding down in the background and its
-                # finally block will harmlessly pop already-removed keys.
+                # Task didn't finish within timeout — keep bookkeeping in place
+                # so the stream remains locked until the task's own cleanup runs.
+                # This prevents a second execution from starting on the same
+                # session while the original task is still mutating state.
                 logger.warning(
-                    "Execution %s did not finish within cancel timeout; force-cleaning bookkeeping",
+                    "Execution %s did not finish within cancel timeout; keeping stream locked "
+                    "until task terminates",
                     execution_id,
                 )
-                async with self._lock:
-                    self._active_executions.pop(execution_id, None)
-                    self._execution_tasks.pop(execution_id, None)
-                self._active_executors.pop(execution_id, None)
+                ctx = self._active_executions.get(execution_id)
+                if ctx is not None:
+                    ctx.status = "cancelling"
+                # Ensure bookkeeping is eventually cleared when the stuck task
+                # finally terminates, even if cancel() timed out.
+                task.add_done_callback(
+                    lambda _t, _execution_id=execution_id: self._schedule_deferred_cleanup(
+                        _execution_id
+                    )
+                )
             return True
         return False
+
+    def _schedule_deferred_cleanup(self, execution_id: str) -> None:
+        """Schedule deferred cleanup and log any background failures."""
+
+        cleanup_task = asyncio.create_task(self._deferred_cleanup(execution_id))
+
+        def _log_cleanup_failure(done_task: asyncio.Task) -> None:
+            try:
+                done_task.result()
+            except Exception:
+                logger.exception("Deferred cleanup failed for execution %s", execution_id)
+
+        cleanup_task.add_done_callback(_log_cleanup_failure)
+
+    async def _deferred_cleanup(self, execution_id: str) -> None:
+        """Best-effort fallback cleanup after timed-out cancellation.
+
+        Normal cleanup happens in _run_execution()'s finally block.
+        This method is idempotent and acts as a safety net for tasks that
+        finish after cancel timeout.
+        """
+
+        async with self._lock:
+            self._active_executions.pop(execution_id, None)
+            self._execution_tasks.pop(execution_id, None)
+            completion_event = self._completion_events.pop(execution_id, None)
+
+        # Keep these pops outside the lock; they are independent and idempotent.
+        self._active_executors.pop(execution_id, None)
+        if completion_event is not None:
+            completion_event.set()
 
     # === STATS AND MONITORING ===
 
